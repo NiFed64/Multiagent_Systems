@@ -1,0 +1,9 @@
+{
+    "java.project.sourcePaths": [
+        "Tsk1/src",
+        "Tsk2/src"
+    ],
+    "java.project.referencedLibraries": [
+        "lib/**/*.jar"
+    ]
+}
