@@ -1,4 +1,3 @@
-// ВНИМАНИЕ: Здесь НЕТ строки package agents;
 
 import jade.core.ProfileImpl;
 import jade.core.Runtime;
