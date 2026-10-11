@@ -19,36 +19,36 @@ public class CoordinatorAgent extends Agent {
 
     private List<AID> calculators = new ArrayList<>();
     
-    // Переменные для передачи данных между состояниями FSM
     private ACLMessage currentExternalRequest;
     private AID originalSender;
     private int expectedReplies;
     private long currentSum;
+    private String currentConvId;
+    
+    private volatile boolean isBusy = false;
 
     @Override
     protected void setup() {
-        System.out.println("[SYSTEM] " + getLocalName().toUpperCase() + ": Started. Searching DF...");
+        if (ClientAgent.monitorMode) System.out.println("[SYSTEM] " + getLocalName().toUpperCase() + ": Started. Searching DF...");
         updateCalculatorsFromDF();
 
-        // Периодическое обновление DF (остается как фоновое поведение)
         addBehaviour(new TickerBehaviour(this, 5000) {
             @Override
-            protected void onTick() { updateCalculatorsFromDF(); }
+            protected void onTick() {
+                if (!isBusy) updateCalculatorsFromDF();
+            }
         });
 
-        // === НОВАЯ ЛОГИКА: Конечный Автомат (FSM) ===
         FSMBehaviour fsm = new FSMBehaviour(this);
         fsm.registerFirstState(new WaitingState(), "WAITING");
         fsm.registerState(new BusyState(), "BUSY");
         
         fsm.registerTransition("WAITING", "BUSY", 1);
-        fsm.registerTransition("BUSY", "WAITING", 0);
-        
+        fsm.registerDefaultTransition("BUSY", "WAITING", new String[]{"WAITING", "BUSY"});
         addBehaviour(fsm);
     }
 
     private void updateCalculatorsFromDF() {
-        // ... (Логика поиска в DF остается без изменений) ...
         DFAgentDescription template = new DFAgentDescription();
         ServiceDescription sd = new ServiceDescription();
         sd.setType("sum-calculation");
@@ -61,11 +61,13 @@ public class CoordinatorAgent extends Agent {
                 int limit = Math.min(3, found.size());
                 calculators.clear();
                 for (int i = 0; i < limit; i++) calculators.add(found.get(i));
+                if (ClientAgent.monitorMode) System.out.println("[INFO] " + getLocalName().toUpperCase() + ": DF updated. Calculators: " + calculators.size());
             }
-        } catch (Exception e) { e.printStackTrace(); }
+        } catch (Exception e) { 
+            if (ClientAgent.monitorMode) System.err.println("[ERROR] " + getLocalName().toUpperCase() + ": DF search failed.");
+        }
     }
 
-    // ================= СОСТОЯНИЕ 1: ОЖИДАНИЕ =================
     private class WaitingState extends SimpleBehaviour {
         private boolean finished = false;
         private MessageTemplate mt = MessageTemplate.and(
@@ -74,12 +76,18 @@ public class CoordinatorAgent extends Agent {
         );
 
         @Override
+        public void onStart() {
+            super.onStart();
+            finished = false;
+        }
+
+        @Override
         public void action() {
             ACLMessage msg = receive(mt);
             if (msg != null) {
                 currentExternalRequest = msg;
                 finished = true;
-                System.out.println("[FSM] " + getLocalName().toUpperCase() + ": External request received. Transitioning WAITING -> BUSY.");
+                if (ClientAgent.monitorMode) System.out.println("[FSM] " + getLocalName().toUpperCase() + ": External request received. Transitioning WAITING -> BUSY.");
             } else {
                 block();
             }
@@ -88,24 +96,33 @@ public class CoordinatorAgent extends Agent {
         @Override
         public boolean done() { return finished; }
         @Override
-        public int onEnd() { return 1; }
+        public int onEnd() { isBusy = true; return 1; }
     }
 
-    // ================= СОСТОЯНИЕ 2: РАСПРЕДЕЛЕНИЕ И СБОР =================
     private class BusyState extends SimpleBehaviour {
-        
+        private boolean taskStarted = false;
+
         @Override
         public void onStart() {
-            // Парсим запрос и рассылаем задачи (как в предыдущих версиях)
+            super.onStart();
+            taskStarted = false;
+            
+            if (calculators.isEmpty()) {
+                if (ClientAgent.monitorMode) System.err.println("[ERROR] No calculators available!");
+                expectedReplies = 0;
+                taskStarted = true;
+                return;
+            }
+
             String[] parts = currentExternalRequest.getContent().split(",");
             int A = Integer.parseInt(parts[0].trim());
             int B = Integer.parseInt(parts[1].trim());
             originalSender = currentExternalRequest.getSender();
             expectedReplies = calculators.size();
             currentSum = 0;
-            String convId = UUID.randomUUID().toString();
+            currentConvId = currentExternalRequest.getConversationId();
 
-            System.out.println("[INFO] " + getLocalName().toUpperCase() + ": Splitting task [" + A + "," + B + "] between " + expectedReplies + " workers.");
+            if (ClientAgent.monitorMode) System.out.println("[INFO] " + getLocalName().toUpperCase() + ": Splitting task [" + A + "," + B + "] between " + expectedReplies + " workers. ConvID: " + currentConvId);
             
             int totalNumbers = B - A + 1;
             int baseSize = totalNumbers / expectedReplies;
@@ -119,15 +136,18 @@ public class CoordinatorAgent extends Agent {
                 req.addReceiver(calculators.get(i));
                 req.setLanguage("sum");
                 req.setContent(currentStart + "," + currentEnd);
-                req.setConversationId(convId);
+                req.setConversationId(currentConvId); // Передаем ID вычислителям
                 send(req);
                 currentStart = currentEnd + 1;
             }
+            taskStarted = true;
         }
 
         @Override
         public void action() {
-            // 1. Отбиваем новые ВНЕШНИЕ запросы (REFUSE)
+            if (!taskStarted) return;
+            
+            // 1. Отбиваем внешние запросы
             MessageTemplate mtExt = MessageTemplate.and(
                     MessageTemplate.MatchPerformative(ACLMessage.REQUEST),
                     MessageTemplate.MatchLanguage("sum")
@@ -138,38 +158,48 @@ public class CoordinatorAgent extends Agent {
                 refuse.setPerformative(ACLMessage.REFUSE);
                 refuse.setContent("Coordinator is busy processing a previous task.");
                 send(refuse);
-                System.out.println("[REFUSE] " + getLocalName().toUpperCase() + " refused external request from " + extMsg.getSender().getLocalName().toUpperCase());
+                if (ClientAgent.monitorMode) System.out.println("[REFUSE] " + getLocalName().toUpperCase() + " refused external request.");
             }
 
-            // 2. Собираем ВНУТРЕННИЕ ответы от вычислителей
-            MessageTemplate mtInt = MessageTemplate.MatchPerformative(ACLMessage.CONFIRM);
+            // 2. Собираем внутренние ответы (строгий фильтр по 3 параметрам)
+            MessageTemplate mtInt = MessageTemplate.and(
+                    MessageTemplate.and(
+                            MessageTemplate.MatchPerformative(ACLMessage.CONFIRM),
+                            MessageTemplate.MatchLanguage("sum")
+                    ),
+                    MessageTemplate.MatchConversationId(currentConvId)
+            );
             ACLMessage intMsg = receive(mtInt);
             if (intMsg != null) {
                 long partialSum = Long.parseLong(intMsg.getContent().trim());
                 currentSum += partialSum;
                 expectedReplies--;
-                System.out.println("[INFO] " + getLocalName().toUpperCase() + ": Received " + partialSum + " from " + intMsg.getSender().getLocalName().toUpperCase() + ". Remaining: " + expectedReplies);
+                if (ClientAgent.monitorMode) System.out.println("[INFO] " + getLocalName().toUpperCase() + ": Received " + partialSum + " from " + intMsg.getSender().getLocalName().toUpperCase() + ". Remaining: " + expectedReplies);
             }
             
-            if (expectedReplies > 0 && intMsg == null && extMsg == null) {
-                block(); // Ждем новых сообщений
+            if (intMsg == null && extMsg == null) {
+                block(100); // Неблокирующая пауза
             }
         }
 
         @Override
-        public boolean done() { return expectedReplies == 0; }
+        public boolean done() { return taskStarted && expectedReplies == 0; }
 
         @Override
         public int onEnd() {
-            // Отправляем итоговый ответ
-            ACLMessage finalReply = new ACLMessage(ACLMessage.CONFIRM);
-            finalReply.addReceiver(originalSender);
+            ACLMessage finalReply = currentExternalRequest.createReply();
+            finalReply.setPerformative(ACLMessage.CONFIRM);
             finalReply.setLanguage("sum");
+            finalReply.setConversationId(currentConvId); // ЯВНАЯ установка ID для клиента
             finalReply.setContent(String.valueOf(currentSum));
             send(finalReply);
             
-            System.out.println("[SUCCESS] " + getLocalName().toUpperCase() + ": All workers finished. Final sum = " + currentSum);
-            System.out.println("[FSM] " + getLocalName().toUpperCase() + ": Transitioning BUSY -> WAITING.");
+            if (ClientAgent.monitorMode) {
+                System.out.println("[SUCCESS] " + getLocalName().toUpperCase() + ": All workers finished. Final sum = " + currentSum);
+                System.out.println("[FSM] " + getLocalName().toUpperCase() + ": Transitioning BUSY -> WAITING.");
+            }
+            
+            isBusy = false;
             return 0;
         }
     }

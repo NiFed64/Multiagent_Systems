@@ -3,6 +3,7 @@ package agents;
 import jade.core.Agent;
 import jade.core.behaviours.FSMBehaviour;
 import jade.core.behaviours.SimpleBehaviour;
+import jade.core.behaviours.ThreadedBehaviourFactory;
 import jade.lang.acl.ACLMessage;
 import jade.lang.acl.MessageTemplate;
 import jade.domain.DFService;
@@ -11,15 +12,14 @@ import jade.domain.FIPAAgentManagement.ServiceDescription;
 
 public class CalculatorAgent extends Agent {
 
-    // Общие переменные для передачи данных между состояниями FSM
     private ACLMessage currentRequest;
-    
+    private ThreadedBehaviourFactory tbf = new ThreadedBehaviourFactory();
+
     @Override
     protected void setup() {
         String name = getLocalName().toUpperCase();
-        System.out.println("[SYSTEM] " + name + ": Initialized and registered in DF.");
+        if (ClientAgent.monitorMode) System.out.println("[SYSTEM] " + name + ": Initialized and registered in DF.");
 
-        // Регистрация в DF (из Задачи 1б)
         DFAgentDescription dfd = new DFAgentDescription();
         dfd.setName(getAID());
         ServiceDescription sd = new ServiceDescription();
@@ -29,21 +29,17 @@ public class CalculatorAgent extends Agent {
         dfd.addServices(sd);
         try { DFService.register(this, dfd); } catch (Exception e) { e.printStackTrace(); }
 
-        // === НОВАЯ ЛОГИКА: Конечный Автомат (FSM) ===
         FSMBehaviour fsm = new FSMBehaviour(this);
-        
-        // Регистрируем состояния
         fsm.registerFirstState(new WaitingState(), "WAITING");
-        fsm.registerState(new BusyState(), "BUSY");
         
-        // Регистрируем переходы
-        fsm.registerTransition("WAITING", "BUSY", 1); // Если WaitingState вернет 1 -> идем в BUSY
-        fsm.registerTransition("BUSY", "WAITING", 0); // Если BusyState вернет 0 -> идем в WAITING
+        // Оборачиваем BusyState в отдельный поток, чтобы он не блокировал агента
+        fsm.registerState(tbf.wrap(new BusyState()), "BUSY");
         
+        fsm.registerTransition("WAITING", "BUSY", 1);
+        fsm.registerDefaultTransition("BUSY", "WAITING", new String[]{"WAITING", "BUSY"});
         addBehaviour(fsm);
     }
 
-    // ================= СОСТОЯНИЕ 1: ОЖИДАНИЕ =================
     private class WaitingState extends SimpleBehaviour {
         private boolean finished = false;
         private MessageTemplate mt = MessageTemplate.and(
@@ -52,89 +48,93 @@ public class CalculatorAgent extends Agent {
         );
 
         @Override
+        public void onStart() {
+            super.onStart();
+            finished = false; // Сброс при каждом входе
+        }
+
+        @Override
         public void action() {
             ACLMessage msg = receive(mt);
             if (msg != null) {
-                currentRequest = msg; // Сохраняем запрос для следующего состояния
+                currentRequest = msg;
                 finished = true;
-                System.out.println("[FSM] " + getLocalName().toUpperCase() + ": Request received. Transitioning WAITING -> BUSY.");
+                if (ClientAgent.monitorMode) System.out.println("[FSM] " + getLocalName().toUpperCase() + ": Request received. Transitioning WAITING -> BUSY.");
             } else {
-                block(); // Ждем сообщения
+                block();
             }
         }
 
         @Override
         public boolean done() { return finished; }
-        
         @Override
-        public int onEnd() { return 1; } // Код перехода в BUSY
+        public int onEnd() { return 1; }
     }
 
-    // ================= СОСТОЯНИЕ 2: ВЫЧИСЛЕНИЕ =================
     private class BusyState extends SimpleBehaviour {
-        private int step = 0;
-        private int totalSteps = 5; // Эмулируем 5 "шагов" вычисления
         private int A, B;
 
         @Override
         public void onStart() {
+            super.onStart();
             String[] parts = currentRequest.getContent().split(",");
             A = Integer.parseInt(parts[0].trim());
             B = Integer.parseInt(parts[1].trim());
-            System.out.println("[INFO] " + getLocalName().toUpperCase() + ": Started calculation from " + A + " to " + B);
+            if (ClientAgent.monitorMode) System.out.println("[INFO] " + getLocalName().toUpperCase() + ": Started calculation from " + A + " to " + B);
         }
 
         @Override
         public void action() {
-            // 1. Проверяем, не пришли ли НОВЫЕ запросы, пока мы заняты
+            // 1. Проверяем новые запросы, чтобы ответить REFUSE
             MessageTemplate mtReq = MessageTemplate.and(
                     MessageTemplate.MatchPerformative(ACLMessage.REQUEST),
                     MessageTemplate.MatchLanguage("sum")
             );
-            ACLMessage msg = receive(mtReq);
-            if (msg != null) {
-                // Отказываем, так как мы заняты
-                ACLMessage refuse = msg.createReply();
+            ACLMessage newReq = receive(mtReq);
+            if (newReq != null) {
+                ACLMessage refuse = newReq.createReply();
                 refuse.setPerformative(ACLMessage.REFUSE);
                 refuse.setContent("I am busy calculating the previous request.");
                 send(refuse);
-                System.out.println("[REFUSE] " + getLocalName().toUpperCase() + " refused request from " + msg.getSender().getLocalName().toUpperCase());
+                if (ClientAgent.monitorMode) System.out.println("[REFUSE] " + getLocalName().toUpperCase() + " refused request from " + newReq.getSender().getLocalName().toUpperCase());
             }
 
-            // 2. Эмулируем работу
-            if (step < totalSteps) {
-                step++;
-                System.out.println("[INFO] " + getLocalName().toUpperCase() + ": Calculating... step " + step + "/" + totalSteps);
-                block(500); // "Спим" 500мс, эмулируя нагрузку и давая другим поведениям шанс сработать
-            } else {
-                // 3. Вычисление завершено
-                long sum = 0;
-                int start = Math.min(A, B);
-                int end = Math.max(A, B);
-                for (int i = start; i <= end; i++) sum += i;
-
-                ACLMessage reply = currentRequest.createReply();
-                reply.setPerformative(ACLMessage.CONFIRM);
-                reply.setLanguage("sum");
-                reply.setContent(String.valueOf(sum));
-                send(reply);
-                System.out.println("[SUCCESS] " + getLocalName().toUpperCase() + ": Finished. Sum = " + sum);
+            // 2. Эмуляция вычисления (в отдельном потоке, поэтому sleep безопасен)
+            long sum = 0;
+            int start = Math.min(A, B);
+            int end = Math.max(A, B);
+            
+            for (int i = 0; i < 5; i++) {
+                if (ClientAgent.monitorMode) System.out.println("[INFO] " + getLocalName().toUpperCase() + ": Calculating... step " + (i+1) + "/5");
+                try { Thread.sleep(300); } catch (InterruptedException e) { break; }
             }
+
+            for (int i = start; i <= end; i++) sum += i;
+
+            // 3. Отправка ответа с ЯВНЫМ указанием ConversationId
+            ACLMessage reply = currentRequest.createReply();
+            reply.setPerformative(ACLMessage.CONFIRM);
+            reply.setLanguage("sum");
+            reply.setConversationId(currentRequest.getConversationId()); // КРИТИЧЕСКИ ВАЖНО
+            reply.setContent(String.valueOf(sum));
+            send(reply);
+            
+            if (ClientAgent.monitorMode) System.out.println("[SUCCESS] " + getLocalName().toUpperCase() + ": Finished. Sum = " + sum);
         }
 
         @Override
-        public boolean done() { return step >= totalSteps; }
+        public boolean done() { return true; } // Одноразовое поведение в потоке
         
         @Override
         public int onEnd() { 
-            System.out.println("[FSM] " + getLocalName().toUpperCase() + ": Calculation done. Transitioning BUSY -> WAITING.");
-            return 0; // Код перехода обратно в WAITING
+            if (ClientAgent.monitorMode) System.out.println("[FSM] " + getLocalName().toUpperCase() + ": Calculation done. Transitioning BUSY -> WAITING.");
+            return 0; 
         }
     }
 
     @Override
     protected void takeDown() {
         try { DFService.deregister(this); } catch (Exception e) {}
-        System.out.println("[SYSTEM] " + getLocalName().toUpperCase() + ": Terminated.");
+        if (ClientAgent.monitorMode) System.out.println("[SYSTEM] " + getLocalName().toUpperCase() + ": Terminated.");
     }
 }
