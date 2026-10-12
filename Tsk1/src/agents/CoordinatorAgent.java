@@ -4,7 +4,6 @@ import jade.core.AID;
 import jade.core.Agent;
 import jade.core.behaviours.FSMBehaviour;
 import jade.core.behaviours.SimpleBehaviour;
-import jade.core.behaviours.TickerBehaviour;
 import jade.lang.acl.ACLMessage;
 import jade.lang.acl.MessageTemplate;
 import jade.domain.DFService;
@@ -29,15 +28,16 @@ public class CoordinatorAgent extends Agent {
 
     @Override
     protected void setup() {
-        if (ClientAgent.monitorMode) System.out.println("[SYSTEM] " + getLocalName().toUpperCase() + ": Started. Searching DF...");
-        updateCalculatorsFromDF();
+        if (ClientAgent.monitorMode) System.out.println("[SYSTEM] " + getLocalName().toUpperCase() + ": Started. Registered in DF.");
 
-        addBehaviour(new TickerBehaviour(this, 5000) {
-            @Override
-            protected void onTick() {
-                if (!isBusy) updateCalculatorsFromDF();
-            }
-        });
+        // Регистрация Координатора в DF для Customer
+        DFAgentDescription dfd = new DFAgentDescription();
+        dfd.setName(getAID());
+        ServiceDescription sd = new ServiceDescription();
+        sd.setType("coordination-service");
+        sd.setName("coordinator-service");
+        dfd.addServices(sd);
+        try { DFService.register(this, dfd); } catch (Exception e) { e.printStackTrace(); }
 
         FSMBehaviour fsm = new FSMBehaviour(this);
         fsm.registerFirstState(new WaitingState(), "WAITING");
@@ -48,23 +48,20 @@ public class CoordinatorAgent extends Agent {
         addBehaviour(fsm);
     }
 
-    private void updateCalculatorsFromDF() {
+    // Метод для поиска Вычислителей (вызывается только при необходимости)
+    private void findCalculators() {
         DFAgentDescription template = new DFAgentDescription();
         ServiceDescription sd = new ServiceDescription();
         sd.setType("sum-calculation");
         template.addServices(sd);
         try {
             DFAgentDescription[] result = DFService.search(this, template);
-            List<AID> found = new ArrayList<>();
-            for (DFAgentDescription dfd : result) found.add(dfd.getName());
-            if (!found.isEmpty()) {
-                int limit = Math.min(3, found.size());
-                calculators.clear();
-                for (int i = 0; i < limit; i++) calculators.add(found.get(i));
-                if (ClientAgent.monitorMode) System.out.println("[INFO] " + getLocalName().toUpperCase() + ": DF updated. Calculators: " + calculators.size());
+            calculators.clear();
+            for (DFAgentDescription dfd : result) {
+                calculators.add(dfd.getName());
             }
         } catch (Exception e) { 
-            if (ClientAgent.monitorMode) System.err.println("[ERROR] " + getLocalName().toUpperCase() + ": DF search failed.");
+            System.err.println("[ERROR] " + getLocalName().toUpperCase() + ": DF search failed.");
         }
     }
 
@@ -87,7 +84,7 @@ public class CoordinatorAgent extends Agent {
             if (msg != null) {
                 currentExternalRequest = msg;
                 finished = true;
-                if (ClientAgent.monitorMode) System.out.println("[FSM] " + getLocalName().toUpperCase() + ": External request received. Transitioning WAITING -> BUSY.");
+                if (ClientAgent.monitorMode) System.out.println("[FSM] " + getLocalName().toUpperCase() + ": Request received from " + msg.getSender().getLocalName().toUpperCase() + ". Transitioning WAITING -> BUSY.");
             } else {
                 block();
             }
@@ -107,8 +104,11 @@ public class CoordinatorAgent extends Agent {
             super.onStart();
             taskStarted = false;
             
+            // Ищем вычислителей только сейчас
+            findCalculators();
+            
             if (calculators.isEmpty()) {
-                if (ClientAgent.monitorMode) System.err.println("[ERROR] No calculators available!");
+                if (ClientAgent.monitorMode) System.err.println("[ERROR] " + getLocalName().toUpperCase() + ": No calculators available!");
                 expectedReplies = 0;
                 taskStarted = true;
                 return;
@@ -136,7 +136,7 @@ public class CoordinatorAgent extends Agent {
                 req.addReceiver(calculators.get(i));
                 req.setLanguage("sum");
                 req.setContent(currentStart + "," + currentEnd);
-                req.setConversationId(currentConvId); 
+                req.setConversationId(currentConvId);
                 send(req);
                 currentStart = currentEnd + 1;
             }
@@ -147,7 +147,7 @@ public class CoordinatorAgent extends Agent {
         public void action() {
             if (!taskStarted) return;
             
-            // 1. Отбиваем внешние запросы
+            // 1. Отбиваем внешние запросы (REFUSE)
             MessageTemplate mtExt = MessageTemplate.and(
                     MessageTemplate.MatchPerformative(ACLMessage.REQUEST),
                     MessageTemplate.MatchLanguage("sum")
@@ -161,7 +161,7 @@ public class CoordinatorAgent extends Agent {
                 if (ClientAgent.monitorMode) System.out.println("[REFUSE] " + getLocalName().toUpperCase() + " refused external request.");
             }
 
-            // 2. Собираем внутренние ответы 
+            // 2. Собираем ответы от Вычислителей
             MessageTemplate mtInt = MessageTemplate.and(
                     MessageTemplate.and(
                             MessageTemplate.MatchPerformative(ACLMessage.CONFIRM),
@@ -178,7 +178,7 @@ public class CoordinatorAgent extends Agent {
             }
             
             if (intMsg == null && extMsg == null) {
-                block(100); // Неблокирующая пауза
+                block(100);
             }
         }
 
@@ -187,20 +187,27 @@ public class CoordinatorAgent extends Agent {
 
         @Override
         public int onEnd() {
+            // Отправляем ответ Customer (originalSender)
             ACLMessage finalReply = currentExternalRequest.createReply();
             finalReply.setPerformative(ACLMessage.CONFIRM);
             finalReply.setLanguage("sum");
-            finalReply.setConversationId(currentConvId); // ЯВНАЯ установка ID для клиента
+            finalReply.setConversationId(currentConvId);
             finalReply.setContent(String.valueOf(currentSum));
             send(finalReply);
             
             if (ClientAgent.monitorMode) {
-                System.out.println("[SUCCESS] " + getLocalName().toUpperCase() + ": All workers finished. Final sum = " + currentSum);
+                System.out.println("[SUCCESS] " + getLocalName().toUpperCase() + ": All workers finished. Final sum = " + currentSum + ". Replying to " + originalSender.getLocalName().toUpperCase());
                 System.out.println("[FSM] " + getLocalName().toUpperCase() + ": Transitioning BUSY -> WAITING.");
             }
             
             isBusy = false;
             return 0;
         }
+    }
+
+    @Override
+    protected void takeDown() {
+        try { DFService.deregister(this); } catch (Exception e) {}
+        if (ClientAgent.monitorMode) System.out.println("[SYSTEM] " + getLocalName().toUpperCase() + ": Terminated.");
     }
 }
