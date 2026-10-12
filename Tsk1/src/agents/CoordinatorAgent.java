@@ -136,7 +136,7 @@ public class CoordinatorAgent extends Agent {
                 req.addReceiver(calculators.get(i));
                 req.setLanguage("sum");
                 req.setContent(currentStart + "," + currentEnd);
-                req.setConversationId(currentConvId); // Передаем ID вычислителям
+                req.setConversationId(currentConvId); 
                 send(req);
                 currentStart = currentEnd + 1;
             }
@@ -161,7 +161,7 @@ public class CoordinatorAgent extends Agent {
                 if (ClientAgent.monitorMode) System.out.println("[REFUSE] " + getLocalName().toUpperCase() + " refused external request.");
             }
 
-            // 2. Собираем внутренние ответы (строгий фильтр по 3 параметрам)
+            // 2. Собираем внутренние ответы 
             MessageTemplate mtInt = MessageTemplate.and(
                     MessageTemplate.and(
                             MessageTemplate.MatchPerformative(ACLMessage.CONFIRM),

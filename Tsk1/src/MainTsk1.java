@@ -13,18 +13,15 @@ public class MainTsk1 {
             
             AgentContainer container = runtime.createMainContainer(profile);
             
-            // Создаем вычислителей (указываем пакет "agents.")
             AgentController calc1 = container.createNewAgent("calc1", "agents.CalculatorAgent", new Object[]{});
             AgentController calc2 = container.createNewAgent("calc2", "agents.CalculatorAgent", new Object[]{});
             AgentController calc3 = container.createNewAgent("calc3", "agents.CalculatorAgent", new Object[]{});
             
             calc1.start(); calc2.start(); calc3.start();
             
-            // Создаем координатора (указываем пакет "agents.")
             AgentController coord = container.createNewAgent("coordinator", "agents.CoordinatorAgent", new Object[]{});
             coord.start();
 
-            // Создаем клиента (указываем пакет "agents.")
             AgentController client = container.createNewAgent("client", "agents.ClientAgent", new Object[]{});
             client.start();
             

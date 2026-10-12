@@ -21,7 +21,7 @@ public class ClientAgent extends Agent {
     protected void setup() {
         if (monitorMode) System.out.println("\n[SYSTEM] CLIENT: Started and ready.");
 
-        // 1. Поведение для прослушивания ответов (СТРОГО ПО CONVERSATION-ID)
+        // 1. Поведение для прослушивания ответов
         addBehaviour(new CyclicBehaviour(this) {
             @Override
             public void action() {
@@ -41,11 +41,10 @@ public class ClientAgent extends Agent {
                 ACLMessage reply = receive(mt);
                 if (reply != null) {
                     if (reply.getPerformative() == ACLMessage.CONFIRM) {
-                        System.out.println("\n✅ RESULT: Final sum = " + reply.getContent());
+                        System.out.println("\n RESULT: Final sum = " + reply.getContent());
                     } else if (reply.getPerformative() == ACLMessage.REFUSE) {
-                        System.out.println("\n❌ RESULT: " + reply.getContent());
+                        System.out.println("\n RESULT: " + reply.getContent());
                     }
-                    // Сбрасываем ID после получения любого ответа (CONFIRM или REFUSE)
                     currentConvId = null; 
                 } else {
                     block();

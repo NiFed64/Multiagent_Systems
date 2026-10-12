@@ -14,12 +14,16 @@ public class CalculatorAgent extends Agent {
 
     private ACLMessage currentRequest;
     private ThreadedBehaviourFactory tbf = new ThreadedBehaviourFactory();
+    
+    // Флаг для отслеживания занятости агента вычислением
+    private volatile boolean isCalculating = false;
 
     @Override
     protected void setup() {
         String name = getLocalName().toUpperCase();
         if (ClientAgent.monitorMode) System.out.println("[SYSTEM] " + name + ": Initialized and registered in DF.");
 
+        // Регистрация в DF (Задача 1б)
         DFAgentDescription dfd = new DFAgentDescription();
         dfd.setName(getAID());
         ServiceDescription sd = new ServiceDescription();
@@ -27,19 +31,28 @@ public class CalculatorAgent extends Agent {
         sd.setName("calculator-service");
         
         dfd.addServices(sd);
-        try { DFService.register(this, dfd); } catch (Exception e) { e.printStackTrace(); }
+        try { 
+            DFService.register(this, dfd); 
+        } catch (Exception e) { 
+            e.printStackTrace(); 
+        }
 
+        // Инициализация FSM (Задача 1в)
         FSMBehaviour fsm = new FSMBehaviour(this);
         fsm.registerFirstState(new WaitingState(), "WAITING");
         
-        // Оборачиваем BusyState в отдельный поток, чтобы он не блокировал агента
+        // ЗАДАЧА 1г: Вычисление реализуется поведением, запущенным в отдельном потоке.
+        // Мы оборачиваем BusyState в ThreadedBehaviourFactory.
+        // Само поведение спроектировано как одноразовое (done() возвращает true после выполнения).
         fsm.registerState(tbf.wrap(new BusyState()), "BUSY");
         
         fsm.registerTransition("WAITING", "BUSY", 1);
         fsm.registerDefaultTransition("BUSY", "WAITING", new String[]{"WAITING", "BUSY"});
+        
         addBehaviour(fsm);
     }
 
+    // ================= СОСТОЯНИЕ 1: ОЖИДАНИЕ =================
     private class WaitingState extends SimpleBehaviour {
         private boolean finished = false;
         private MessageTemplate mt = MessageTemplate.and(
@@ -50,91 +63,128 @@ public class CalculatorAgent extends Agent {
         @Override
         public void onStart() {
             super.onStart();
-            finished = false; // Сброс при каждом входе
+            finished = false;
         }
 
         @Override
         public void action() {
             ACLMessage msg = receive(mt);
             if (msg != null) {
-                currentRequest = msg;
-                finished = true;
-                if (ClientAgent.monitorMode) System.out.println("[FSM] " + getLocalName().toUpperCase() + ": Request received. Transitioning WAITING -> BUSY.");
+                if (isCalculating) {
+                    // Агент уже считает, отвергаем новый запрос (Задача 1в + 1г)
+                    ACLMessage refuse = msg.createReply();
+                    refuse.setPerformative(ACLMessage.REFUSE);
+                    refuse.setContent("I am currently processing another request in a separate thread.");
+                    send(refuse);
+                    if (ClientAgent.monitorMode) {
+                        System.out.println("[REFUSE] " + getLocalName().toUpperCase() + " rejected new request (already calculating).");
+                    }
+                    } else {
+                    currentRequest = msg;
+                    isCalculating = true; 
+                    finished = true;      
+                    
+                    if (ClientAgent.monitorMode) {
+                        System.out.println("[FSM] " + getLocalName().toUpperCase() + ": Request accepted. Transitioning WAITING -> BUSY.");
+                    }
+                }
             } else {
-                block();
+                block(); 
             }
         }
 
         @Override
-        public boolean done() { return finished; }
+        public boolean done() { 
+            return finished; 
+        }
+        
         @Override
-        public int onEnd() { return 1; }
+        public int onEnd() { 
+            return 1; 
+        }
     }
 
+    // ================= СОСТОЯНИЕ 2: ВЫЧИСЛЕНИЕ (ОДНОРАЗОВОЕ, В ОТДЕЛЬНОМ ПОТОКЕ) =================
     private class BusyState extends SimpleBehaviour {
+        private boolean isDone = false;
         private int A, B;
 
         @Override
         public void onStart() {
             super.onStart();
+            isDone = false;
             String[] parts = currentRequest.getContent().split(",");
             A = Integer.parseInt(parts[0].trim());
             B = Integer.parseInt(parts[1].trim());
-            if (ClientAgent.monitorMode) System.out.println("[INFO] " + getLocalName().toUpperCase() + ": Started calculation from " + A + " to " + B);
+            
+            if (ClientAgent.monitorMode) {
+                System.out.println("[INFO] " + getLocalName().toUpperCase() + ": Started calculation (Thread: " + Thread.currentThread().getName() + ") from " + A + " to " + B);
+            }
         }
 
         @Override
         public void action() {
-            // 1. Проверяем новые запросы, чтобы ответить REFUSE
-            MessageTemplate mtReq = MessageTemplate.and(
-                    MessageTemplate.MatchPerformative(ACLMessage.REQUEST),
-                    MessageTemplate.MatchLanguage("sum")
-            );
-            ACLMessage newReq = receive(mtReq);
-            if (newReq != null) {
-                ACLMessage refuse = newReq.createReply();
-                refuse.setPerformative(ACLMessage.REFUSE);
-                refuse.setContent("I am busy calculating the previous request.");
-                send(refuse);
-                if (ClientAgent.monitorMode) System.out.println("[REFUSE] " + getLocalName().toUpperCase() + " refused request from " + newReq.getSender().getLocalName().toUpperCase());
-            }
-
-            // 2. Эмуляция вычисления (в отдельном потоке, поэтому sleep безопасен)
+            // 1. Эмуляция длительных вычислений 
             long sum = 0;
             int start = Math.min(A, B);
             int end = Math.max(A, B);
             
             for (int i = 0; i < 5; i++) {
-                if (ClientAgent.monitorMode) System.out.println("[INFO] " + getLocalName().toUpperCase() + ": Calculating... step " + (i+1) + "/5");
-                try { Thread.sleep(300); } catch (InterruptedException e) { break; }
+                if (ClientAgent.monitorMode) {
+                    System.out.println("[INFO] " + getLocalName().toUpperCase() + ": Calculating... step " + (i+1) + "/5");
+                }
+                try { 
+                    Thread.sleep(300); 
+                } catch (InterruptedException e) { 
+                    Thread.currentThread().interrupt();
+                    break; 
+                }
             }
 
-            for (int i = start; i <= end; i++) sum += i;
+            // 2. Непосредственное вычисление
+            for (int i = start; i <= end; i++) {
+                sum += i;
+            }
 
-            // 3. Отправка ответа с ЯВНЫМ указанием ConversationId
+            // 3. Отправка ответа с явным указанием ConversationId
             ACLMessage reply = currentRequest.createReply();
             reply.setPerformative(ACLMessage.CONFIRM);
             reply.setLanguage("sum");
-            reply.setConversationId(currentRequest.getConversationId()); // КРИТИЧЕСКИ ВАЖНО
+            reply.setConversationId(currentRequest.getConversationId()); 
             reply.setContent(String.valueOf(sum));
             send(reply);
             
-            if (ClientAgent.monitorMode) System.out.println("[SUCCESS] " + getLocalName().toUpperCase() + ": Finished. Sum = " + sum);
+            if (ClientAgent.monitorMode) {
+                System.out.println("[SUCCESS] " + getLocalName().toUpperCase() + ": Finished. Sum = " + sum);
+            }
+
+            // 4. Освобождаем агент для новых задач
+            isCalculating = false;
+            isDone = true; 
         }
 
         @Override
-        public boolean done() { return true; } // Одноразовое поведение в потоке
+        public boolean done() { 
+            return isDone; // Возвращает true после одного полного цикла выполнения (одноразовое поведение)
+        }
         
         @Override
         public int onEnd() { 
-            if (ClientAgent.monitorMode) System.out.println("[FSM] " + getLocalName().toUpperCase() + ": Calculation done. Transitioning BUSY -> WAITING.");
+            if (ClientAgent.monitorMode) {
+                System.out.println("[FSM] " + getLocalName().toUpperCase() + ": One-shot behaviour finished. Transitioning BUSY -> WAITING.");
+            }
             return 0; 
         }
     }
 
     @Override
     protected void takeDown() {
-        try { DFService.deregister(this); } catch (Exception e) {}
-        if (ClientAgent.monitorMode) System.out.println("[SYSTEM] " + getLocalName().toUpperCase() + ": Terminated.");
+        try { 
+            DFService.deregister(this); 
+        } catch (Exception e) {}
+        
+        if (ClientAgent.monitorMode) {
+            System.out.println("[SYSTEM] " + getLocalName().toUpperCase() + ": Terminated.");
+        }
     }
 }
