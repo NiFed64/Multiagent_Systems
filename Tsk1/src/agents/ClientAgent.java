@@ -38,9 +38,9 @@ public class ClientAgent extends Agent {
                 ACLMessage reply = receive(mt);
                 if (reply != null) {
                     if (reply.getPerformative() == ACLMessage.CONFIRM) {
-                        System.out.println("\n✅ RESULT: Final sum = " + reply.getContent());
+                        LogUtil.resultConfirm(reply.getContent());
                     } else if (reply.getPerformative() == ACLMessage.REFUSE) {
-                        System.out.println("\n❌ RESULT: " + reply.getContent());
+                        LogUtil.resultRefuse(reply.getContent());
                     }
                     currentConvId = null; 
                 } else {
@@ -124,7 +124,7 @@ public class ClientAgent extends Agent {
         
         send(request);
         if (!ClientAgent.monitorMode) {
-            System.out.println("[CLIENT] Request '" + content + "' sent to CUSTOMER. Waiting for result...");
+            LogUtil.client("Request '" + content + "' sent to CUSTOMER. Waiting for result...");
         }
     }
 
@@ -132,21 +132,22 @@ public class ClientAgent extends Agent {
     private void sendTestCommand(String command) {
         ACLMessage request = new ACLMessage(ACLMessage.REQUEST);
         request.addReceiver(new AID("customer", AID.ISLOCALNAME));
-        request.setLanguage(command); 
-        
+        request.setLanguage(command);
+
         if (command.equalsIgnoreCase("test-refuse")) {
-            // Для REFUSE нужно две задачи, чтобы Customer отправил их по очереди на одного координатора
-            request.setContent("1,10;11,20"); 
+            request.setContent("1,10;11,20");
+        } else if (command.equalsIgnoreCase("test-parallel")) {
+            request.setContent("1,100;200,300");
         } else {
-            // Для PARALLEL нужна одна задача, которую Customer разошлет обоим координаторам одновременно
-            request.setContent("1,10"); 
+            return;
         }
-        
+
         currentConvId = UUID.randomUUID().toString();
         request.setConversationId(currentConvId);
-        
+
         send(request);
-        System.out.println("[CLIENT] Sent '" + command + "' command to CUSTOMER.");
+
+        LogUtil.client("Sent '" + command + "' command to CUSTOMER.");
     }
 
     @Override

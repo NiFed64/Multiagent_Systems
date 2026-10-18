@@ -10,17 +10,22 @@ import jade.domain.FIPAAgentManagement.DFAgentDescription;
 import jade.domain.FIPAAgentManagement.ServiceDescription;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.UUID;
 
 public class CustomerAgent extends Agent {
 
-    private int coordinatorIndex = 0; // Для Round-Robin обычных задач
+    private int coordinatorIndex = 0;
+    private final Set<String> internalTestConvIds = new HashSet<>();
 
     @Override
     protected void setup() {
-        if (ClientAgent.monitorMode) System.out.println("[SYSTEM] CUSTOMER: Started. Acting as Smart Dispatcher.");
+        LogUtil.sys("CUSTOMER", "Started as dispatcher.");
 
-        // 1. Обычные задачи (Load Balancer)
+        // 1. Обычные задачи от Клиента
         addBehaviour(new CyclicBehaviour(this) {
             @Override
             public void action() {
@@ -28,13 +33,17 @@ public class CustomerAgent extends Agent {
                         MessageTemplate.MatchPerformative(ACLMessage.REQUEST),
                         MessageTemplate.MatchLanguage("sum")
                 );
+
                 ACLMessage msg = receive(mt);
-                if (msg != null) dispatchTask(msg, true);
-                else block();
+                if (msg != null) {
+                    dispatchTask(msg);
+                } else {
+                    block();
+                }
             }
         });
 
-        // 2. Тест на REFUSE (Задача 1в) - отправка на ОДНОГО координатора
+        // 2. Тест REFUSE
         addBehaviour(new CyclicBehaviour(this) {
             @Override
             public void action() {
@@ -42,13 +51,17 @@ public class CustomerAgent extends Agent {
                         MessageTemplate.MatchPerformative(ACLMessage.REQUEST),
                         MessageTemplate.MatchLanguage("test-refuse")
                 );
+
                 ACLMessage msg = receive(mt);
-                if (msg != null) runRefuseTest(msg);
-                else block();
+                if (msg != null) {
+                    runRefuseTest(msg);
+                } else {
+                    block();
+                }
             }
         });
 
-        // 3. Тест на ПАРАЛЛЕЛИЗМ (Задача 1г) - отправка на ВСЕХ координаторов
+        // 3. Тест параллельной работы
         addBehaviour(new CyclicBehaviour(this) {
             @Override
             public void action() {
@@ -56,48 +69,74 @@ public class CustomerAgent extends Agent {
                         MessageTemplate.MatchPerformative(ACLMessage.REQUEST),
                         MessageTemplate.MatchLanguage("test-parallel")
                 );
+
                 ACLMessage msg = receive(mt);
-                if (msg != null) runParallelTest(msg);
-                else block();
-            }
-        });
-
-        // 4. Сбор ответов от Координаторов и пересылка Клиенту
-        addBehaviour(new CyclicBehaviour(this) {
-            @Override
-            public void action() {
-                MessageTemplate mt = MessageTemplate.and(
-                        MessageTemplate.MatchPerformative(ACLMessage.CONFIRM),
-                        MessageTemplate.MatchLanguage("sum")
-                );
-                ACLMessage reply = receive(mt);
-                if (reply != null) {
-                    ACLMessage toClient = new ACLMessage(ACLMessage.CONFIRM);
-                    toClient.addReceiver(new AID("client", AID.ISLOCALNAME));
-                    toClient.setLanguage("sum");
-                    toClient.setConversationId(reply.getConversationId()); // Пробрасываем ID Клиента
-                    toClient.setContent(reply.getContent());
-                    send(toClient);
-
-                    if (ClientAgent.monitorMode) {
-                        System.out.println("[INFO] CUSTOMER: Forwarded result from " + reply.getSender().getLocalName().toUpperCase() + " to Client.");
-                    }
+                if (msg != null) {
+                    runParallelTest(msg);
                 } else {
                     block();
                 }
             }
         });
+
+        // 4. Ответы от Координаторов
+        addBehaviour(new CyclicBehaviour(this) {
+            @Override
+            public void action() {
+                MessageTemplate mt = MessageTemplate.and(
+                        MessageTemplate.MatchLanguage("sum"),
+                        MessageTemplate.or(
+                                MessageTemplate.MatchPerformative(ACLMessage.CONFIRM),
+                                MessageTemplate.MatchPerformative(ACLMessage.REFUSE)
+                        )
+                );
+
+                ACLMessage reply = receive(mt);
+                if (reply == null) {
+                    block();
+                    return;
+                }
+
+                String convId = reply.getConversationId();
+                String perf = ACLMessage.getPerformative(reply.getPerformative());
+
+                // Внутренние результаты parallel-теста не отправляем клиенту.
+                if (convId != null && internalTestConvIds.contains(convId)) {
+                    internalTestConvIds.remove(convId);
+
+                    LogUtil.debug("CUSTOMER",
+                            "INTERNAL RESULT from " +
+                                    reply.getSender().getLocalName().toUpperCase() +
+                                    " " + perf +
+                                    " value=" + reply.getContent());
+                    return;
+                }
+
+                ACLMessage toClient = new ACLMessage(reply.getPerformative());
+                toClient.addReceiver(new AID("client", AID.ISLOCALNAME));
+                toClient.setLanguage("sum");
+                toClient.setConversationId(reply.getConversationId());
+                toClient.setContent(reply.getContent());
+                send(toClient);
+
+                LogUtil.net("CUSTOMER",
+                        "-> CLIENT " + perf + " value=" + reply.getContent());
+            }
+        });
     }
 
-    // --- ЛОГИКА ОБЫЧНЫХ ЗАДАЧ ---
-    private void dispatchTask(ACLMessage clientRequest, boolean incrementIndex) {
+    private void dispatchTask(ACLMessage clientRequest) {
         List<AID> coordinators = findCoordinators();
-        if (coordinators.isEmpty()) return;
+        if (coordinators.isEmpty()) {
+            return;
+        }
 
         AID target = coordinators.get(coordinatorIndex % coordinators.size());
-        if (incrementIndex) coordinatorIndex++;
+        coordinatorIndex++;
 
-        if (ClientAgent.monitorMode) System.out.println("[INFO] CUSTOMER: Assigning task to " + target.getLocalName().toUpperCase());
+        LogUtil.net("CUSTOMER",
+                "-> " + target.getLocalName().toUpperCase() +
+                        " task " + clientRequest.getContent());
 
         ACLMessage request = new ACLMessage(ACLMessage.REQUEST);
         request.addReceiver(target);
@@ -107,68 +146,94 @@ public class CustomerAgent extends Agent {
         send(request);
     }
 
-    // --- ЛОГИКА ТЕСТА REFUSE (Задача 1в) ---
     private void runRefuseTest(ACLMessage clientRequest) {
         List<AID> coordinators = findCoordinators();
-        if (coordinators.isEmpty()) return;
+        if (coordinators.isEmpty()) {
+            return;
+        }
 
-        // Берем только ОДНОГО координатора
         AID target = coordinators.get(coordinatorIndex % coordinators.size());
-        
-        if (ClientAgent.monitorMode) System.out.println("\n[TEST-REFUSE] CUSTOMER: Sending 2 rapid requests to " + target.getLocalName().toUpperCase() + " (Task 1v)");
 
         String[] tasks = clientRequest.getContent().split(";");
+
+        LogUtil.net("CUSTOMER",
+                "-> " + target.getLocalName().toUpperCase() +
+                        " test-refuse tasks=" + Arrays.toString(tasks));
+
+        String convId = clientRequest.getConversationId();
+        if (convId == null || convId.isEmpty()) {
+            convId = UUID.randomUUID().toString();
+        }
+
         for (String task : tasks) {
             ACLMessage request = new ACLMessage(ACLMessage.REQUEST);
             request.addReceiver(target);
             request.setLanguage("sum");
             request.setContent(task);
-            request.setConversationId(clientRequest.getConversationId()); // Один ID для обоих, чтобы Клиент их принял
+            request.setConversationId(convId);
             send(request);
-            if (ClientAgent.monitorMode) System.out.println("[TEST-REFUSE] Sent task: " + task);
         }
-        // Индекс не двигаем, чтобы следующий обычный запрос ушел на другого
     }
 
-    // --- ЛОГИКА ТЕСТА ПАРАЛЛЕЛИЗМА (Задача 1г) ---
     private void runParallelTest(ACLMessage clientRequest) {
         List<AID> coordinators = findCoordinators();
-        if (coordinators.isEmpty()) return;
-
-        if (ClientAgent.monitorMode) System.out.println("\n[TEST-PARALLEL] CUSTOMER: Broadcasting tasks to ALL " + coordinators.size() + " Coordinators (Task 1g)");
-
-        // Отправляем задачу КАЖДОМУ координатору одновременно
-        for (AID coord : coordinators) {
-            ACLMessage request = new ACLMessage(ACLMessage.REQUEST);
-            request.addReceiver(coord);
-            request.setLanguage("sum");
-            request.setContent(clientRequest.getContent());
-            request.setConversationId(clientRequest.getConversationId());
-            send(request);
-            if (ClientAgent.monitorMode) System.out.println("[TEST-PARALLEL] Sent task to " + coord.getLocalName().toUpperCase());
+        if (coordinators.isEmpty()) {
+            return;
         }
-        coordinatorIndex += coordinators.size(); // Сдвигаем индекс на количество использованных
+
+        String[] tasks = clientRequest.getContent().split(";");
+
+        LogUtil.net("CUSTOMER",
+                "test-parallel tasks=" + Arrays.toString(tasks) +
+                        " coordinators=" + coordinators.size());
+
+        int used = Math.min(tasks.length, coordinators.size());
+
+        for (int i = 0; i < used; i++) {
+            String internalConvId = UUID.randomUUID().toString();
+            internalTestConvIds.add(internalConvId);
+
+            ACLMessage request = new ACLMessage(ACLMessage.REQUEST);
+            request.addReceiver(coordinators.get(i));
+            request.setLanguage("sum");
+            request.setContent(tasks[i]);
+            request.setConversationId(internalConvId);
+            send(request);
+
+            LogUtil.net("CUSTOMER",
+                    "-> " + coordinators.get(i).getLocalName().toUpperCase() +
+                            " parallel task " + tasks[i] +
+                            " (internal)");
+        }
+
+        coordinatorIndex += used;
     }
 
-    // Вспомогательный метод поиска
     private List<AID> findCoordinators() {
         DFAgentDescription template = new DFAgentDescription();
+
         ServiceDescription sd = new ServiceDescription();
         sd.setType("coordination-service");
         template.addServices(sd);
+
         try {
             DFAgentDescription[] result = DFService.search(this, template);
+
             List<AID> list = new ArrayList<>();
-            for (DFAgentDescription dfd : result) list.add(dfd.getName());
+            for (DFAgentDescription dfd : result) {
+                list.add(dfd.getName());
+            }
+
             return list;
+
         } catch (Exception e) {
-            System.err.println("[ERROR] CUSTOMER: DF search failed.");
+            LogUtil.err("CUSTOMER", "DF search failed: " + e.getMessage());
             return new ArrayList<>();
         }
     }
 
     @Override
     protected void takeDown() {
-        if (ClientAgent.monitorMode) System.out.println("[SYSTEM] CUSTOMER: Terminated.");
+        LogUtil.sys("CUSTOMER", "Terminated.");
     }
 }
