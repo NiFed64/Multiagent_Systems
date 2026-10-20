@@ -7,17 +7,29 @@ import jade.lang.acl.ACLMessage;
 import jade.lang.acl.MessageTemplate;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public class GraphNodeAgent extends Agent {
 
-    private List<AID> neighbors = new ArrayList<>();
-    private Map<String, SearchContext> activeSearches = new HashMap<>();
+    // Жёсткий предел длины пути.
+    // Для цикла из 4 узлов достаточно 8, но можно увеличить для больших графов.
+    private static final int MAX_HOPS = 8;
 
-    private class SearchContext {
+    private final List<AID> neighbors = new ArrayList<>();
+
+    // Активные поиски, которые этот узел сейчас обрабатывает.
+    private final Map<String, SearchContext> activeSearches = new HashMap<>();
+
+    // Множество searchId, которые этот узел уже видел.
+    // Нужно для циклических графов: один и тот же поиск может прийти
+    // в узел двумя разными путями. Обрабатываем только первый приход.
+    private final Set<String> seenSearchIds = new HashSet<>();
+
+    private static class SearchContext {
         AID requester;
         int expectedReplies;
         String foundPath;
@@ -40,9 +52,12 @@ public class GraphNodeAgent extends Agent {
                 neighbors.add(new AID((String) arg, AID.ISLOCALNAME));
             }
         }
-        System.out.println("[INFO] " + name + ": My neighbors are " + neighbors);
 
-        // 1. Поведение для обработки входящих REQUEST (поиск маршрута)
+        System.out.println("[INFO] " + name + ": Neighbors = " + neighborNames());
+
+        // ============================================================
+        // 1. Приём REQUEST от соседей или клиента
+        // ============================================================
         addBehaviour(new CyclicBehaviour(this) {
             @Override
             public void action() {
@@ -50,6 +65,7 @@ public class GraphNodeAgent extends Agent {
                         MessageTemplate.MatchPerformative(ACLMessage.REQUEST),
                         MessageTemplate.MatchLanguage("graph-routing")
                 );
+
                 ACLMessage msg = receive(mt);
                 if (msg == null) {
                     block();
@@ -59,11 +75,12 @@ public class GraphNodeAgent extends Agent {
             }
         });
 
-        // 2. Поведение для обработки ответов CONFIRM и DISCONFIRM от соседей (ИСПРАВЛЕНО)
+        // ============================================================
+        // 2. Приём CONFIRM / DISCONFIRM от соседей
+        // ============================================================
         addBehaviour(new CyclicBehaviour(this) {
             @Override
             public void action() {
-                // Создаем корректный MessageTemplate вместо лямбда-выражения
                 MessageTemplate mt = MessageTemplate.and(
                         MessageTemplate.or(
                                 MessageTemplate.MatchPerformative(ACLMessage.CONFIRM),
@@ -71,19 +88,14 @@ public class GraphNodeAgent extends Agent {
                         ),
                         MessageTemplate.MatchLanguage("graph-routing")
                 );
-                
+
                 ACLMessage msg = receive(mt);
-                
+
                 if (msg == null) {
                     block();
-                } else {
-                    // Дополнительная проверка: относится ли сообщение к нашим активным поискам
-                    if (msg.getConversationId() != null && activeSearches.containsKey(msg.getConversationId())) {
-                        handleRouteReply(msg);
-                    } else {
-                        // Игнорируем сообщения с неизвестным ConversationId (защита от мусора)
-                        System.out.println("[INFO] " + getLocalName().toUpperCase() + ": Ignored message with unknown ConversationId.");
-                    }
+                } else if (msg.getConversationId() != null
+                        && activeSearches.containsKey(msg.getConversationId())) {
+                    handleRouteReply(msg);
                 }
             }
         });
@@ -91,116 +103,240 @@ public class GraphNodeAgent extends Agent {
 
     private void handleRouteRequest(ACLMessage msg) {
         String myName = getLocalName();
+        String upper = myName.toUpperCase();
+
         String content = msg.getContent();
+        if (content == null || content.isEmpty()) {
+            return;
+        }
+
         String[] parts = content.split(";");
-        
+        if (parts.length < 2) {
+            return;
+        }
+
         String searchId = parts[0];
         String destination = parts[1];
         String pathSoFar = parts.length > 2 ? parts[2] : "";
 
-        System.out.println("[INFO] " + myName.toUpperCase() + ": Received route request to " + destination + ". Path: [" + pathSoFar + "]");
+        System.out.println("[INFO] " + upper + ": REQUEST to " + destination.toUpperCase()
+                + " path=[" + pathSoFar + "]");
 
-        SearchContext ctx = new SearchContext(msg.getSender());
-        activeSearches.put(searchId, ctx);
-
-        // Сценарий 1: Мы - конечная цель!
-        if (destination.equals(myName)) {
-            String finalPath = pathSoFar.isEmpty() ? myName : pathSoFar + "," + myName;
-            System.out.println("[SUCCESS] " + myName.toUpperCase() + ": I am the destination! Replying to " + msg.getSender().getLocalName().toUpperCase());
-            
-            ACLMessage reply = msg.createReply();
-            reply.setPerformative(ACLMessage.CONFIRM);
-            reply.setLanguage("graph-routing");
-            reply.setContent(searchId + ";" + finalPath);
-            send(reply);
-            
-            activeSearches.remove(searchId);
+        // ============================================================
+        // Защита от повторной обработки одного и того же поиска.
+        // ============================================================
+        if (!seenSearchIds.add(searchId)) {
+            System.out.println("[CYCLE] " + upper + ": Duplicate searchId "
+                    + shortId(searchId) + ". DISCONFIRM.");
+            sendDisconfirm(msg, searchId);
             return;
         }
 
-        // Сценарий 2: Защита от зацикливания (точная проверка по словам)
-        if (!pathSoFar.isEmpty()) {
-            List<String> pathNodes = Arrays.asList(pathSoFar.split(","));
-            if (pathNodes.contains(myName)) {
-                System.out.println("[INFO] " + myName.toUpperCase() + ": Loop detected. Replying DISCONFIRM.");
-                ACLMessage reply = msg.createReply();
-                reply.setPerformative(ACLMessage.DISCONFIRM);
-                reply.setContent(searchId);
-                send(reply);
-                activeSearches.remove(searchId);
-                return;
-            }
+        List<String> visited = splitPath(pathSoFar);
+
+        // ============================================================
+        // Сценарий 1: мы и есть целевой узел.
+        // ============================================================
+        if (destination.equals(myName)) {
+            String finalPath = appendPath(pathSoFar, myName);
+            System.out.println("[SUCCESS] " + upper + ": Destination reached. Path=" + finalPath);
+            sendConfirm(msg, searchId, finalPath);
+            return;
         }
 
-        // Сценарий 3: Пересылаем запрос соседям
-        String newPath = pathSoFar.isEmpty() ? myName : pathSoFar + "," + myName;
-        
+        // ============================================================
+        // Сценарий 2: мы уже были в этом пути.
+        // Это прямая защита от цикла.
+        // ============================================================
+        if (visited.contains(myName)) {
+            System.out.println("[CYCLE] " + upper + ": Already in path [" + pathSoFar + "]. DISCONFIRM.");
+            sendDisconfirm(msg, searchId);
+            return;
+        }
+
+        // ============================================================
+        // Сценарий 3: превышен максимальный размер пути.
+        // Страховка от очень больших или некорректных графов.
+        // ============================================================
+        if (visited.size() >= MAX_HOPS) {
+            System.out.println("[CYCLE] " + upper + ": Max hops reached. DISCONFIRM.");
+            sendDisconfirm(msg, searchId);
+            return;
+        }
+
+        // ============================================================
+        // Сценарий 4: пересылаем запрос соседям,
+        // которые ещё не были в пути.
+        // ============================================================
+        String newPath = appendPath(pathSoFar, myName);
+        List<String> newPathVisited = splitPath(newPath);
+
+        SearchContext ctx = new SearchContext(msg.getSender());
+
         for (AID neighbor : neighbors) {
-            List<String> pathNodes = Arrays.asList(newPath.split(","));
-            if (!pathNodes.contains(neighbor.getLocalName())) {
-                ACLMessage fwd = new ACLMessage(ACLMessage.REQUEST);
-                fwd.addReceiver(neighbor);
-                fwd.setLanguage("graph-routing");
-                fwd.setContent(searchId + ";" + destination + ";" + newPath);
-                fwd.setConversationId(searchId);
-                send(fwd);
-                ctx.expectedReplies++;
-                System.out.println("[INFO] " + myName.toUpperCase() + ": Forwarded to " + neighbor.getLocalName().toUpperCase());
+            String neighborName = neighbor.getLocalName();
+
+            if (newPathVisited.contains(neighborName)) {
+                System.out.println("[CYCLE] " + upper + ": Skip neighbor "
+                        + neighborName.toUpperCase() + " already in path.");
+                continue;
             }
+
+            ACLMessage fwd = new ACLMessage(ACLMessage.REQUEST);
+            fwd.addReceiver(neighbor);
+            fwd.setLanguage("graph-routing");
+            fwd.setConversationId(searchId);
+            fwd.setContent(searchId + ";" + destination + ";" + newPath);
+            send(fwd);
+
+            ctx.expectedReplies++;
+
+            System.out.println("[INFO] " + upper + ": Forwarded to "
+                    + neighborName.toUpperCase() + " path=[" + newPath + "]");
         }
 
-        // Если некому пересылать (тупик), сразу отвечаем отказом
+        // ============================================================
+        // Если пересылать некуда — тупик.
+        // ============================================================
         if (ctx.expectedReplies == 0) {
-            System.out.println("[INFO] " + myName.toUpperCase() + ": Dead end. Replying DISCONFIRM.");
-            ACLMessage reply = msg.createReply();
-            reply.setPerformative(ACLMessage.DISCONFIRM);
-            reply.setContent(searchId);
-            send(reply);
-            activeSearches.remove(searchId);
+            System.out.println("[CYCLE] " + upper + ": Dead end. DISCONFIRM.");
+            sendDisconfirm(msg, searchId);
+            return;
         }
+
+        activeSearches.put(searchId, ctx);
     }
 
     private void handleRouteReply(ACLMessage msg) {
         String myName = getLocalName();
+        String upper = myName.toUpperCase();
+
         String searchId = msg.getConversationId();
         SearchContext ctx = activeSearches.get(searchId);
 
-        if (ctx == null) return;
+        if (ctx == null) {
+            return;
+        }
 
         if (msg.getPerformative() == ACLMessage.CONFIRM) {
-            String path = msg.getContent().split(";")[1];
-            System.out.println("[SUCCESS] " + myName.toUpperCase() + ": Received CONFIRM from " + msg.getSender().getLocalName().toUpperCase() + ". Path: " + path);
-            
-            // Если мы еще не находили путь, сохраняем и пересылаем дальше "вверх"
+            String[] parts = msg.getContent().split(";");
+            String path = parts.length > 1 ? parts[1] : "";
+
+            System.out.println("[SUCCESS] " + upper + ": CONFIRM from "
+                    + msg.getSender().getLocalName().toUpperCase()
+                    + " path=" + path);
+
+            // Отправляем CONFIRM вверх только один раз — первый найденный путь.
             if (ctx.foundPath == null) {
                 ctx.foundPath = path;
-                ACLMessage reply = new ACLMessage(ACLMessage.CONFIRM);
-                reply.addReceiver(ctx.requester);
-                reply.setLanguage("graph-routing");
-                reply.setContent(searchId + ";" + path);
-                reply.setConversationId(searchId);
-                send(reply);
+                sendConfirmUp(ctx.requester, searchId, path);
             }
-        } else { // DISCONFIRM
-            System.out.println("[INFO] " + myName.toUpperCase() + ": Received DISCONFIRM from " + msg.getSender().getLocalName().toUpperCase());
+        } else {
+            System.out.println("[INFO] " + upper + ": DISCONFIRM from "
+                    + msg.getSender().getLocalName().toUpperCase());
         }
 
         ctx.expectedReplies--;
 
-        // Если все соседи ответили, а путь так и не найден -> отправляем DISCONFIRM "вверх"
-        if (ctx.expectedReplies == 0 && ctx.foundPath == null) {
-            System.out.println("[ERROR] " + myName.toUpperCase() + ": All branches failed. Replying DISCONFIRM to " + ctx.requester.getLocalName().toUpperCase());
-            ACLMessage reply = new ACLMessage(ACLMessage.DISCONFIRM);
-            reply.addReceiver(ctx.requester);
-            reply.setLanguage("graph-routing");
-            reply.setContent(searchId);
-            reply.setConversationId(searchId);
-            send(reply);
-            activeSearches.remove(searchId);
-        } else if (ctx.expectedReplies == 0) {
-            // Путь найден, все ответы собраны, очищаем память
+        // Когда все соседи ответили, очищаем контекст.
+        if (ctx.expectedReplies == 0) {
+            if (ctx.foundPath == null) {
+                System.out.println("[ERROR] " + upper + ": All branches failed. DISCONFIRM to "
+                        + ctx.requester.getLocalName().toUpperCase());
+                sendDisconfirmUp(ctx.requester, searchId);
+            }
+
             activeSearches.remove(searchId);
         }
+    }
+
+    // ================================================================
+    // Вспомогательные методы отправки ответов
+    // ================================================================
+
+    private void sendConfirm(ACLMessage original, String searchId, String path) {
+        ACLMessage reply = original.createReply();
+        reply.setPerformative(ACLMessage.CONFIRM);
+        reply.setLanguage("graph-routing");
+        reply.setConversationId(searchId);
+        reply.setContent(searchId + ";" + path);
+        send(reply);
+    }
+
+    private void sendConfirmUp(AID receiver, String searchId, String path) {
+        ACLMessage reply = new ACLMessage(ACLMessage.CONFIRM);
+        reply.addReceiver(receiver);
+        reply.setLanguage("graph-routing");
+        reply.setConversationId(searchId);
+        reply.setContent(searchId + ";" + path);
+        send(reply);
+    }
+
+    private void sendDisconfirm(ACLMessage original, String searchId) {
+        ACLMessage reply = original.createReply();
+        reply.setPerformative(ACLMessage.DISCONFIRM);
+        reply.setLanguage("graph-routing");
+        reply.setConversationId(searchId);
+        reply.setContent(searchId);
+        send(reply);
+    }
+
+    private void sendDisconfirmUp(AID receiver, String searchId) {
+        ACLMessage reply = new ACLMessage(ACLMessage.DISCONFIRM);
+        reply.addReceiver(receiver);
+        reply.setLanguage("graph-routing");
+        reply.setConversationId(searchId);
+        reply.setContent(searchId);
+        send(reply);
+    }
+
+    // ================================================================
+    // Работа с путём
+    // ================================================================
+
+    private List<String> splitPath(String path) {
+        List<String> result = new ArrayList<>();
+
+        if (path == null || path.isEmpty()) {
+            return result;
+        }
+
+        for (String p : path.split(",")) {
+            String trimmed = p.trim();
+            if (!trimmed.isEmpty()) {
+                result.add(trimmed);
+            }
+        }
+
+        return result;
+    }
+
+    private String appendPath(String path, String node) {
+        if (path == null || path.isEmpty()) {
+            return node;
+        }
+        return path + "," + node;
+    }
+
+    private String neighborNames() {
+        StringBuilder sb = new StringBuilder("[");
+
+        for (int i = 0; i < neighbors.size(); i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(neighbors.get(i).getLocalName().toUpperCase());
+        }
+
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private String shortId(String id) {
+        if (id == null || id.isEmpty()) {
+            return "null";
+        }
+        return id.length() <= 8 ? id : id.substring(0, 8);
     }
 
     @Override
