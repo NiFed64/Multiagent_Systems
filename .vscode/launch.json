@@ -1,0 +1,65 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+        "type": "java",
+        "name": "AgentContainerTsk2",
+        "request": "launch",
+        "mainClass": "AgentContainerTsk2",
+        "projectName": "Lab1_e042b43a"
+    },
+    {
+        "type": "java",
+        "name": "MainContainerTsk2",
+        "request": "launch",
+        "mainClass": "MainContainerTsk2",
+        "projectName": "Lab1_e042b43a"
+    },
+    {
+        "type": "java",
+        "name": "Tsk1: Main Container",
+        "request": "launch",
+        "mainClass": "MainContainerTsk1",
+        "projectName": "Lab1"
+    },
+    {
+        "type": "java",
+        "name": "Tsk1: Agent Container",
+        "request": "launch",
+        "mainClass": "AgentContainerTsk1",
+        "projectName": "Lab1"
+    },
+    {
+        "type": "java",
+        "name": "Tsk2: Main Container",
+        "request": "launch",
+        "mainClass": "MainContainerTsk2",
+        "projectName": "Lab1"
+    },
+    {
+        "type": "java",
+        "name": "Tsk2: Agent Container",
+        "request": "launch",
+        "mainClass": "AgentContainerTsk2",
+        "projectName": "Lab1"
+    }
+],
+  "compounds": [
+    {
+      "name": "Tsk1: Full Platform",
+      "configurations": [
+        "Tsk1: Main Container",
+        "Tsk1: Agent Container"
+      ],
+      "stopAll": true
+    },
+    {
+      "name": "Tsk2: Full Platform",
+      "configurations": [
+        "Tsk2: Main Container",
+        "Tsk2: Agent Container"
+      ],
+      "stopAll": true
+    }
+  ]
+}
