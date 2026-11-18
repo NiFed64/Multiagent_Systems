@@ -2,13 +2,15 @@ package agents;
 
 import jade.core.AID;
 import jade.core.Agent;
+import jade.core.behaviours.CyclicBehaviour;
 import jade.core.behaviours.FSMBehaviour;
 import jade.core.behaviours.SimpleBehaviour;
-import jade.lang.acl.ACLMessage;
-import jade.lang.acl.MessageTemplate;
+import jade.core.behaviours.TickerBehaviour;
 import jade.domain.DFService;
 import jade.domain.FIPAAgentManagement.DFAgentDescription;
 import jade.domain.FIPAAgentManagement.ServiceDescription;
+import jade.lang.acl.ACLMessage;
+import jade.lang.acl.MessageTemplate;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -17,6 +19,11 @@ import java.util.Map;
 import java.util.UUID;
 
 public class CoordinatorAgent extends Agent {
+
+    // === ЗАДАЧА 1з: тайминги живости ===
+    private static final long HEARTBEAT_INTERVAL = 2000L;
+    private static final String HEARTBEAT_LANG = "coordination-heartbeat";
+    private static final String KILL_LANG = "kill-switch";
 
     private final List<AID> calculators = new ArrayList<>();
 
@@ -73,7 +80,7 @@ public class CoordinatorAgent extends Agent {
         String name = getLocalName().toUpperCase();
         LogUtil.sys(name, "Started. Registered in DF as Contract Net Initiator.");
 
-        // Регистрация Координатора в DF для Заказчика
+        // Регистрация Координатора в DF для Customer (Задача 1б/1ж)
         DFAgentDescription dfd = new DFAgentDescription();
         dfd.setName(getAID());
 
@@ -88,6 +95,32 @@ public class CoordinatorAgent extends Agent {
             LogUtil.err(name, "DF registration failed: " + e.getMessage());
         }
 
+        // === ЗАДАЧА 1з: heartbeat, чтобы вычислители видели, что координатор жив ===
+        addBehaviour(new TickerBehaviour(this, HEARTBEAT_INTERVAL) {
+            @Override
+            protected void onTick() {
+                sendHeartbeat();
+            }
+        });
+
+        // === ЗАДАЧА 1з: kill-switch ===
+        addBehaviour(new CyclicBehaviour(this) {
+            private final MessageTemplate mt = MessageTemplate.and(
+                    MessageTemplate.MatchPerformative(ACLMessage.REQUEST),
+                    MessageTemplate.MatchLanguage(KILL_LANG)
+            );
+
+            @Override
+            public void action() {
+                ACLMessage msg = receive(mt);
+                if (msg == null) {
+                    block();
+                } else {
+                    handleKillSwitch(msg);
+                }
+            }
+        });
+
         FSMBehaviour fsm = new FSMBehaviour(this);
         fsm.registerFirstState(new WaitingState(), "WAITING");
         fsm.registerState(new BusyState(), "BUSY");
@@ -97,6 +130,104 @@ public class CoordinatorAgent extends Agent {
 
         addBehaviour(fsm);
     }
+
+    // ================================================================
+    // ЗАДАЧА 1з: heartbeat и kill-switch
+    // ================================================================
+
+    private void sendHeartbeat() {
+        String myName = getLocalName();
+
+        // Локальный поиск вычислителей, НЕ трогая поле calculators (оно занято FSM).
+        List<AID> targets = findCalculatorsLocal();
+
+        if (targets.isEmpty()) {
+            return;
+        }
+
+        ACLMessage hb = new ACLMessage(ACLMessage.INFORM);
+        hb.setLanguage(HEARTBEAT_LANG);
+        hb.setContent("HEARTBEAT;" + myName);
+
+        for (AID calc : targets) {
+            hb.addReceiver(calc);
+        }
+
+        send(hb);
+
+        LogUtil.debug(getLocalName().toUpperCase(),
+                "HEARTBEAT -> " + targets.size() + " calculators");
+    }
+
+    private void handleKillSwitch(ACLMessage msg) {
+        String name = getLocalName().toUpperCase();
+
+        LogUtil.net(name, "KILL-SWITCH received from "
+                + msg.getSender().getLocalName().toUpperCase() + ". Dying gracefully.");
+
+        // 1. Сигнал всем вычислителям о смерти (для мгновенных перевыборов).
+        sendDeathSignal();
+
+        // 2. Явная дерегистрация из DF ДО doDelete (Задача 1з).
+        try {
+            DFService.deregister(this);
+            LogUtil.net(name, "DEREGISTERED from DF.");
+        } catch (Exception e) {
+            LogUtil.err(name, "DF deregistration error: " + e.getMessage());
+        }
+
+        // 3. Убийство агента.
+        doDelete();
+    }
+
+    private void sendDeathSignal() {
+        String myName = getLocalName();
+        List<AID> targets = findCalculatorsLocal();
+
+        if (targets.isEmpty()) {
+            return;
+        }
+
+        ACLMessage died = new ACLMessage(ACLMessage.INFORM);
+        died.setLanguage(HEARTBEAT_LANG);
+        died.setContent("COORDINATOR_DIED;" + myName);
+
+        for (AID calc : targets) {
+            died.addReceiver(calc);
+        }
+
+        send(died);
+
+        LogUtil.net(myName.toUpperCase(),
+                "DEATH SIGNAL -> " + targets.size() + " calculators");
+    }
+
+    private List<AID> findCalculatorsLocal() {
+        DFAgentDescription template = new DFAgentDescription();
+
+        ServiceDescription sd = new ServiceDescription();
+        sd.setType("sum-calculation");
+        template.addServices(sd);
+
+        List<AID> result = new ArrayList<>();
+
+        try {
+            DFAgentDescription[] found = DFService.search(this, template);
+            if (found != null) {
+                for (DFAgentDescription dfd : found) {
+                    result.add(dfd.getName());
+                }
+            }
+        } catch (Exception e) {
+            LogUtil.err(getLocalName().toUpperCase(), "Local DF search failed: " + e.getMessage());
+        }
+
+        return result;
+    }
+
+    // ================================================================
+    // DF-поиск вычислителей для Contract Net (как было)
+    // ================================================================
 
     private void findCalculators() {
         DFAgentDescription template = new DFAgentDescription();
@@ -116,6 +247,10 @@ public class CoordinatorAgent extends Agent {
             LogUtil.err(getLocalName().toUpperCase(), "DF search failed: " + e.getMessage());
         }
     }
+
+    // ================================================================
+    // FSM: WAITING
+    // ================================================================
 
     private class WaitingState extends SimpleBehaviour {
         private boolean finished = false;
@@ -161,6 +296,10 @@ public class CoordinatorAgent extends Agent {
             return 1;
         }
     }
+
+    // ================================================================
+    // FSM: BUSY (Contract Net Initiator)
+    // ================================================================
 
     private class BusyState extends SimpleBehaviour {
         private boolean taskStarted = false;
@@ -271,7 +410,7 @@ public class CoordinatorAgent extends Agent {
 
             String name = getLocalName().toUpperCase();
 
-            // 1. Отбиваем новые внешние запросы, пока Координатор занят.
+            // 1. Отбиваем новые внешние запросы (Задача 1в).
             MessageTemplate mtExt = MessageTemplate.and(
                     MessageTemplate.MatchPerformative(ACLMessage.REQUEST),
                     MessageTemplate.MatchLanguage("sum")
@@ -289,7 +428,7 @@ public class CoordinatorAgent extends Agent {
                 LogUtil.net(name, "REFUSE -> " + extMsg.getSender().getLocalName().toUpperCase());
             }
 
-            // 2. Обрабатываем внутренние Contract Net сообщения.
+            // 2. Contract Net сообщения.
             MessageTemplate mtCn = MessageTemplate.and(
                     MessageTemplate.MatchLanguage("sum-cn"),
                     MessageTemplate.MatchConversationId(currentConvId)
@@ -332,6 +471,10 @@ public class CoordinatorAgent extends Agent {
             return 0;
         }
     }
+
+    // ================================================================
+    // Contract Net обработка (как в 1д, без изменений)
+    // ================================================================
 
     private void handleCnMessage(ACLMessage msg) {
         int performative = msg.getPerformative();
@@ -419,7 +562,6 @@ public class CoordinatorAgent extends Agent {
         ctx.resolved = true;
         subtasksRemaining--;
 
-        // Никто не предложил — контракт провален, INFORM не придёт, удаляем сразу.
         if (ctx.proposals.isEmpty()) {
             LogUtil.cn(name, "NO PROPOSALS " + ctx.subTaskId);
             contracts.remove(ctx.subTaskId);
@@ -464,7 +606,6 @@ public class CoordinatorAgent extends Agent {
             return;
         }
 
-        // ACCEPT-PROPOSAL выбранному вычислителю
         ACLMessage accept = new ACLMessage(ACLMessage.ACCEPT_PROPOSAL);
         accept.addReceiver(best.sender);
         accept.setLanguage("sum-cn");
@@ -472,7 +613,6 @@ public class CoordinatorAgent extends Agent {
         accept.setContent(ctx.subTaskId + ";" + ctx.start + ";" + ctx.end);
         send(accept);
 
-        // REJECT-PROPOSAL остальным
         StringBuilder rejects = new StringBuilder();
 
         for (Proposal p : ctx.proposals.values()) {
@@ -514,8 +654,7 @@ public class CoordinatorAgent extends Agent {
                         " cost=" + best.cost +
                         (rejects.length() > 0 ? " rejects=" + rejects : ""));
 
-        // ВАЖНО: контракт НЕ удаляем здесь — он нужен handleInform для учёта INFORM.
-        // Удаляем только после получения INFORM (см. handleInform).
+        // Контракт НЕ удаляем здесь — нужен handleInform для учёта INFORM.
         checkAwardsCompleted(name);
     }
 
@@ -551,7 +690,7 @@ public class CoordinatorAgent extends Agent {
             currentSum += sum;
             informsPending--;
 
-            contracts.remove(subTaskId);   // ← удаление теперь ТОЛЬКО здесь
+            contracts.remove(subTaskId);
 
             LogUtil.cn(name,
                     "INFORM " + subTaskId +
@@ -567,10 +706,12 @@ public class CoordinatorAgent extends Agent {
 
     @Override
     protected void takeDown() {
+        // === ЗАДАЧА 1з: гарантированная дерегистрация при любом завершении ===
         try {
             DFService.deregister(this);
+            LogUtil.net(getLocalName().toUpperCase(), "DEREGISTERED from DF on takeDown.");
         } catch (Exception e) {
-            // ignore
+            // Уже дерегистрирован в kill-switch — игнорируем.
         }
 
         LogUtil.sys(getLocalName().toUpperCase(), "Terminated.");
