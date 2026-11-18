@@ -4,11 +4,14 @@ import jade.core.Agent;
 import jade.core.behaviours.CyclicBehaviour;
 import jade.core.behaviours.OneShotBehaviour;
 import jade.core.behaviours.ThreadedBehaviourFactory;
-import jade.lang.acl.ACLMessage;
-import jade.lang.acl.MessageTemplate;
 import jade.domain.DFService;
 import jade.domain.FIPAAgentManagement.DFAgentDescription;
 import jade.domain.FIPAAgentManagement.ServiceDescription;
+import jade.lang.acl.ACLMessage;
+import jade.lang.acl.MessageTemplate;
+
+import java.util.ArrayList;
+import java.util.List;
 
 public class CalculatorAgent extends Agent {
 
@@ -19,7 +22,7 @@ public class CalculatorAgent extends Agent {
         String name = getLocalName().toUpperCase();
         LogUtil.sys(name, "Initialized and registered in DF.");
 
-        // Регистрация в DF
+        // Регистрация в DF как вычислитель
         DFAgentDescription dfd = new DFAgentDescription();
         dfd.setName(getAID());
 
@@ -34,6 +37,21 @@ public class CalculatorAgent extends Agent {
             LogUtil.err(name, "DF registration failed: " + e.getMessage());
         }
 
+        // Читаем имена других вычислителей из аргументов
+        Object[] args = getArguments();
+        List<String> peerNames = new ArrayList<>();
+
+        if (args != null) {
+            for (Object arg : args) {
+                if (arg != null) {
+                    peerNames.add(arg.toString());
+                }
+            }
+        }
+
+        // ЗАДАЧА 1ж: отдельное поведение выборов координатора
+        addBehaviour(new ElectionBehaviour(this, peerNames.toArray(new String[0]), 2));
+
         // Старый прямой режим REQUEST/CONFIRM на языке "sum"
         addBehaviour(new CyclicBehaviour(this) {
             private final MessageTemplate mt = MessageTemplate.and(
@@ -44,6 +62,7 @@ public class CalculatorAgent extends Agent {
             @Override
             public void action() {
                 ACLMessage msg = receive(mt);
+
                 if (msg == null) {
                     block();
                     return;
@@ -61,6 +80,7 @@ public class CalculatorAgent extends Agent {
             @Override
             public void action() {
                 ACLMessage msg = receive(mt);
+
                 if (msg == null) {
                     block();
                     return;
@@ -88,11 +108,13 @@ public class CalculatorAgent extends Agent {
 
         try {
             String content = cfp.getContent();
+
             if (content == null || content.isEmpty()) {
                 return;
             }
 
             String[] parts = content.split(";");
+
             if (parts.length < 3) {
                 return;
             }
@@ -110,6 +132,7 @@ public class CalculatorAgent extends Agent {
             propose.setLanguage("sum-cn");
             propose.setConversationId(cfp.getConversationId());
             propose.setContent(subTaskId + ";" + cost);
+
             send(propose);
 
             LogUtil.debug(name, "PROPOSE " + subTaskId + " cost=" + cost);
@@ -186,6 +209,7 @@ public class CalculatorAgent extends Agent {
                 reply.setLanguage("sum");
                 reply.setConversationId(msg.getConversationId());
                 reply.setContent(String.valueOf(sum));
+
                 send(reply);
 
                 LogUtil.debug(name, "LEGACY DONE sum=" + sum);
@@ -211,11 +235,13 @@ public class CalculatorAgent extends Agent {
 
             try {
                 String content = accept.getContent();
+
                 if (content == null || content.isEmpty()) {
                     return;
                 }
 
                 String[] parts = content.split(";");
+
                 if (parts.length < 3) {
                     return;
                 }
@@ -232,6 +258,7 @@ public class CalculatorAgent extends Agent {
                 emulateWork();
 
                 long sum = 0;
+
                 for (int i = start; i <= end; i++) {
                     sum += i;
                 }
@@ -241,6 +268,7 @@ public class CalculatorAgent extends Agent {
                 inform.setLanguage("sum-cn");
                 inform.setConversationId(accept.getConversationId());
                 inform.setContent(subTaskId + ";" + sum);
+
                 send(inform);
 
                 LogUtil.debug(name, "CN DONE " + subTaskId + " sum=" + sum);

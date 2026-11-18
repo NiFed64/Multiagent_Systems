@@ -8,43 +8,68 @@ public class AgentContainerTsk1 {
         try {
             Runtime runtime = Runtime.instance();
 
-            // Профиль периферийного контейнера: указываем, К КАКОМУ главному подключаемся
             ProfileImpl profile = new ProfileImpl();
             profile.setParameter(ProfileImpl.MAIN_HOST, "localhost");
             profile.setParameter(ProfileImpl.MAIN_PORT, "1099");
             profile.setParameter(ProfileImpl.CONTAINER_NAME, "Container-1");
-            // GUI здесь НЕ включаем — RMA уже есть в главном контейнере
 
             AgentContainer agentContainer = runtime.createAgentContainer(profile);
 
             System.out.println("==================================================");
             System.out.println("[AGENT] Peripheral container 'Container-1' joined the platform.");
-            System.out.println("[AGENT] Launching agents ...");
+            System.out.println("[AGENT] Launching calculators WITHOUT predefined coordinators.");
+            System.out.println("[AGENT] Calculators will elect a coordinator pool.");
+            System.out.println("[AGENT] Default pool size: 2 coordinators.");
             System.out.println("==================================================");
 
-            // --- Вычислители (регистрируются в DF главного контейнера) ---
-            AgentController calc1 = agentContainer.createNewAgent("calc1", "agents.CalculatorAgent", new Object[]{});
-            AgentController calc2 = agentContainer.createNewAgent("calc2", "agents.CalculatorAgent", new Object[]{});
-            AgentController calc3 = agentContainer.createNewAgent("calc3", "agents.CalculatorAgent", new Object[]{});
-            calc1.start(); calc2.start(); calc3.start();
+            // Вычислители знают только друг друга.
+            // Координаторы будут созданы победителями выборов.
+            AgentController calc1 = agentContainer.createNewAgent(
+                    "calc1",
+                    "agents.CalculatorAgent",
+                    new Object[]{"calc2", "calc3"}
+            );
 
-            // --- Координаторы (Contract Net Initiator, тоже в DF) ---
-            AgentController coord1 = agentContainer.createNewAgent("coord1", "agents.CoordinatorAgent", new Object[]{});
-            AgentController coord2 = agentContainer.createNewAgent("coord2", "agents.CoordinatorAgent", new Object[]{});
-            coord1.start(); coord2.start();
+            AgentController calc2 = agentContainer.createNewAgent(
+                    "calc2",
+                    "agents.CalculatorAgent",
+                    new Object[]{"calc1", "calc3"}
+            );
 
-            // --- Клиент (консольный ввод) ---
-            AgentController client = agentContainer.createNewAgent("client", "agents.ClientAgent", new Object[]{});
+            AgentController calc3 = agentContainer.createNewAgent(
+                    "calc3",
+                    "agents.CalculatorAgent",
+                    new Object[]{"calc1", "calc2"}
+            );
+
+            calc1.start();
+            calc2.start();
+            calc3.start();
+
+            AgentController client = agentContainer.createNewAgent(
+                    "client",
+                    "agents.ClientAgent",
+                    new Object[]{}
+            );
+
+            AgentController customer = agentContainer.createNewAgent(
+                    "customer",
+                    "agents.CustomerAgent",
+                    new Object[]{}
+            );
+
             client.start();
-
-            // --- Заказчик (диспетчер / агрегатор) ---
-            AgentController customer = agentContainer.createNewAgent("customer", "agents.CustomerAgent", new Object[]{});
             customer.start();
 
-            System.out.println("[AGENT] All agents launched in Container-1.");
-            System.out.println("[AGENT] Type commands in THIS terminal (client lives here).");
+            System.out.println("[AGENT] Base agents launched.");
+            System.out.println("[AGENT] Wait a few seconds for election.");
+            System.out.println("[AGENT] Then use THIS terminal:");
+            System.out.println("[AGENT]   test-refuse");
+            System.out.println("[AGENT]   test-parallel");
+            System.out.println("[AGENT]   1");
+            System.out.println("[AGENT]   2");
+            System.out.println("[AGENT]   A,B");
 
-            // Держим процесс живым, иначе JVM выйдет и контейнер отвалится от платформы
             Thread.currentThread().join();
 
         } catch (Exception e) {

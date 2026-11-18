@@ -3,11 +3,12 @@ package agents;
 import jade.core.AID;
 import jade.core.Agent;
 import jade.core.behaviours.CyclicBehaviour;
-import jade.lang.acl.ACLMessage;
-import jade.lang.acl.MessageTemplate;
+import jade.core.behaviours.TickerBehaviour;
 import jade.domain.DFService;
 import jade.domain.FIPAAgentManagement.DFAgentDescription;
 import jade.domain.FIPAAgentManagement.ServiceDescription;
+import jade.lang.acl.ACLMessage;
+import jade.lang.acl.MessageTemplate;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -19,11 +20,25 @@ import java.util.UUID;
 public class CustomerAgent extends Agent {
 
     private int coordinatorIndex = 0;
+
     private final Set<String> internalTestConvIds = new HashSet<>();
+    private final List<PendingRequest> pending = new ArrayList<>();
+
+    private static class PendingRequest {
+        final String type;
+        final String content;
+        final String convId;
+
+        PendingRequest(String type, String content, String convId) {
+            this.type = type;
+            this.content = content;
+            this.convId = convId;
+        }
+    }
 
     @Override
     protected void setup() {
-        LogUtil.sys("CUSTOMER", "Started as dispatcher.");
+        LogUtil.sys("CUSTOMER", "Started as dispatcher with election-aware retry.");
 
         // 1. Обычные задачи от Клиента
         addBehaviour(new CyclicBehaviour(this) {
@@ -35,8 +50,9 @@ public class CustomerAgent extends Agent {
                 );
 
                 ACLMessage msg = receive(mt);
+
                 if (msg != null) {
-                    dispatchTask(msg);
+                    handleIncoming(msg, "sum");
                 } else {
                     block();
                 }
@@ -53,8 +69,9 @@ public class CustomerAgent extends Agent {
                 );
 
                 ACLMessage msg = receive(mt);
+
                 if (msg != null) {
-                    runRefuseTest(msg);
+                    handleIncoming(msg, "test-refuse");
                 } else {
                     block();
                 }
@@ -71,8 +88,9 @@ public class CustomerAgent extends Agent {
                 );
 
                 ACLMessage msg = receive(mt);
+
                 if (msg != null) {
-                    runParallelTest(msg);
+                    handleIncoming(msg, "test-parallel");
                 } else {
                     block();
                 }
@@ -92,6 +110,7 @@ public class CustomerAgent extends Agent {
                 );
 
                 ACLMessage reply = receive(mt);
+
                 if (reply == null) {
                     block();
                     return;
@@ -104,11 +123,14 @@ public class CustomerAgent extends Agent {
                 if (convId != null && internalTestConvIds.contains(convId)) {
                     internalTestConvIds.remove(convId);
 
-                    LogUtil.debug("CUSTOMER",
+                    LogUtil.debug(
+                            "CUSTOMER",
                             "INTERNAL RESULT from " +
                                     reply.getSender().getLocalName().toUpperCase() +
                                     " " + perf +
-                                    " value=" + reply.getContent());
+                                    " value=" + reply.getContent()
+                    );
+
                     return;
                 }
 
@@ -117,75 +139,158 @@ public class CustomerAgent extends Agent {
                 toClient.setLanguage("sum");
                 toClient.setConversationId(reply.getConversationId());
                 toClient.setContent(reply.getContent());
+
                 send(toClient);
 
-                LogUtil.net("CUSTOMER",
-                        "-> CLIENT " + perf + " value=" + reply.getContent());
+                LogUtil.net(
+                        "CUSTOMER",
+                        "-> CLIENT " + perf + " value=" + reply.getContent()
+                );
+            }
+        });
+
+        // 5. Периодическая обработка очереди, если координатор ещё не выбран
+        addBehaviour(new TickerBehaviour(this, 1000) {
+            @Override
+            protected void onTick() {
+                processPending();
             }
         });
     }
 
-    private void dispatchTask(ACLMessage clientRequest) {
+    private void handleIncoming(ACLMessage msg, String type) {
+        String convId = msg.getConversationId();
+
+        if (convId == null || convId.isEmpty()) {
+            convId = UUID.randomUUID().toString();
+        }
+
+        PendingRequest pr = new PendingRequest(type, msg.getContent(), convId);
+
         List<AID> coordinators = findCoordinators();
+        int required = requiredCoordinatorsFor(type, pr.content);
+
+        if (coordinators.size() < required) {
+            pending.add(pr);
+
+            LogUtil.net(
+                    "CUSTOMER",
+                    "Not enough coordinators in DF (" +
+                            coordinators.size() + "/" + required +
+                            "). Queued " + type
+            );
+
+        } else {
+            dispatchPending(pr, coordinators);
+        }
+    }
+
+    private void processPending() {
+        if (pending.isEmpty()) {
+            return;
+        }
+
+        List<AID> coordinators = findCoordinators();
+
         if (coordinators.isEmpty()) {
             return;
         }
 
+        java.util.Iterator<PendingRequest> it = pending.iterator();
+
+        while (it.hasNext()) {
+            PendingRequest pr = it.next();
+            int required = requiredCoordinatorsFor(pr.type, pr.content);
+
+            if (coordinators.size() >= required) {
+                it.remove();
+                dispatchPending(pr, coordinators);
+            }
+        }
+    }
+
+    private int requiredCoordinatorsFor(String type, String content) {
+        if ("test-parallel".equals(type)) {
+            int tasks = 0;
+
+            if (content != null && !content.isEmpty()) {
+                tasks = content.split(";").length;
+            }
+
+            return Math.max(1, tasks);
+        }
+
+        return 1;
+    }
+
+    private void dispatchPending(PendingRequest pr, List<AID> coordinators) {
+        if (coordinators.isEmpty()) {
+            pending.add(pr);
+            return;
+        }
+
+        switch (pr.type) {
+            case "sum":
+                dispatchNormal(pr, coordinators);
+                break;
+
+            case "test-refuse":
+                dispatchRefuseTest(pr, coordinators);
+                break;
+
+            case "test-parallel":
+                dispatchParallelTest(pr, coordinators);
+                break;
+
+            default:
+                LogUtil.err("CUSTOMER", "Unknown pending type: " + pr.type);
+                break;
+        }
+    }
+
+    private void dispatchNormal(PendingRequest pr, List<AID> coordinators) {
         AID target = coordinators.get(coordinatorIndex % coordinators.size());
         coordinatorIndex++;
-
-        LogUtil.net("CUSTOMER",
-                "-> " + target.getLocalName().toUpperCase() +
-                        " task " + clientRequest.getContent());
 
         ACLMessage request = new ACLMessage(ACLMessage.REQUEST);
         request.addReceiver(target);
         request.setLanguage("sum");
-        request.setContent(clientRequest.getContent());
-        request.setConversationId(clientRequest.getConversationId());
+        request.setContent(pr.content);
+        request.setConversationId(pr.convId);
+
         send(request);
+
+        LogUtil.net(
+                "CUSTOMER",
+                "-> " + target.getLocalName().toUpperCase() +
+                        " task " + pr.content
+        );
     }
 
-    private void runRefuseTest(ACLMessage clientRequest) {
-        List<AID> coordinators = findCoordinators();
-        if (coordinators.isEmpty()) {
-            return;
-        }
-
+    private void dispatchRefuseTest(PendingRequest pr, List<AID> coordinators) {
         AID target = coordinators.get(coordinatorIndex % coordinators.size());
 
-        String[] tasks = clientRequest.getContent().split(";");
-
-        LogUtil.net("CUSTOMER",
-                "-> " + target.getLocalName().toUpperCase() +
-                        " test-refuse tasks=" + Arrays.toString(tasks));
-
-        String convId = clientRequest.getConversationId();
-        if (convId == null || convId.isEmpty()) {
-            convId = UUID.randomUUID().toString();
-        }
+        String[] tasks = pr.content.split(";");
 
         for (String task : tasks) {
             ACLMessage request = new ACLMessage(ACLMessage.REQUEST);
             request.addReceiver(target);
             request.setLanguage("sum");
             request.setContent(task);
-            request.setConversationId(convId);
+            request.setConversationId(pr.convId);
+
             send(request);
         }
+
+        LogUtil.net(
+                "CUSTOMER",
+                "-> " + target.getLocalName().toUpperCase() +
+                        " test-refuse tasks=" + Arrays.toString(tasks)
+        );
     }
 
-    private void runParallelTest(ACLMessage clientRequest) {
-        List<AID> coordinators = findCoordinators();
-        if (coordinators.isEmpty()) {
-            return;
-        }
-
-        String[] tasks = clientRequest.getContent().split(";");
-
-        LogUtil.net("CUSTOMER",
-                "test-parallel tasks=" + Arrays.toString(tasks) +
-                        " coordinators=" + coordinators.size());
+    private void dispatchParallelTest(PendingRequest pr, List<AID> coordinators) {
+        String[] tasks = pr.content.split(";");
 
         int used = Math.min(tasks.length, coordinators.size());
 
@@ -193,17 +298,22 @@ public class CustomerAgent extends Agent {
             String internalConvId = UUID.randomUUID().toString();
             internalTestConvIds.add(internalConvId);
 
+            AID target = coordinators.get((coordinatorIndex + i) % coordinators.size());
+
             ACLMessage request = new ACLMessage(ACLMessage.REQUEST);
-            request.addReceiver(coordinators.get(i));
+            request.addReceiver(target);
             request.setLanguage("sum");
             request.setContent(tasks[i]);
             request.setConversationId(internalConvId);
+
             send(request);
 
-            LogUtil.net("CUSTOMER",
-                    "-> " + coordinators.get(i).getLocalName().toUpperCase() +
+            LogUtil.net(
+                    "CUSTOMER",
+                    "-> " + target.getLocalName().toUpperCase() +
                             " parallel task " + tasks[i] +
-                            " (internal)");
+                            " (internal)"
+            );
         }
 
         coordinatorIndex += used;
@@ -220,8 +330,11 @@ public class CustomerAgent extends Agent {
             DFAgentDescription[] result = DFService.search(this, template);
 
             List<AID> list = new ArrayList<>();
-            for (DFAgentDescription dfd : result) {
-                list.add(dfd.getName());
+
+            if (result != null) {
+                for (DFAgentDescription dfd : result) {
+                    list.add(dfd.getName());
+                }
             }
 
             return list;
